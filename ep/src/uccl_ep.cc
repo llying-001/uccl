@@ -1433,6 +1433,33 @@ class Buffer {
     }
   }
 
+
+  void sync_same_process(std::vector<int> const& device_ids,
+                         std::vector<std::uintptr_t> const& all_buffer_ptrs) {
+    EP_HOST_ASSERT(not is_available());
+    EP_HOST_ASSERT(num_nvl_bytes > 0);
+    EP_HOST_ASSERT(static_cast<std::size_t>(num_ranks) == device_ids.size());
+    EP_HOST_ASSERT(static_cast<std::size_t>(num_ranks) == all_buffer_ptrs.size());
+
+    for (int i = 0, offset = rdma_rank * num_nvl_ranks; i < num_nvl_ranks; ++i) {
+      int global_rank = offset + i;
+      int local_rank_idx = global_rank % max_nvl_peers;
+      if (global_rank != rank) {
+        buffer_ptrs[local_rank_idx] = reinterpret_cast<void*>(all_buffer_ptrs[global_rank]);
+        barrier_signal_ptrs[local_rank_idx] = reinterpret_cast<int*>(
+            static_cast<uint8_t*>(buffer_ptrs[local_rank_idx]) + num_nvl_bytes);
+      }
+    }
+
+    CUDA_CHECK(cudaSetDevice(device_index));
+    CUDA_CHECK(cudaMemcpy(buffer_ptrs_gpu, buffer_ptrs,
+                          sizeof(void*) * max_nvl_peers, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(barrier_signal_ptrs_gpu, barrier_signal_ptrs,
+                          sizeof(int*) * max_nvl_peers, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    available = true;
+  }
+
   void sync(std::vector<int> const& device_ids,
             std::vector<std::optional<nb::bytes>> const& all_gathered_handles,
             std::optional<nb::bytes> const& root_unique_id_opt,
@@ -1829,7 +1856,9 @@ NB_MODULE(ep, m) {
       .def("get_comm_stream", &Buffer::get_comm_stream)
       .def("get_local_uccl_shmem_unique_id",
            &Buffer::get_local_uccl_shmem_unique_id)
-      .def("sync", &Buffer::sync, nb::arg("device_ids"),
+      .def("sync_same_process", &Buffer::sync_same_process,
+           nb::arg("device_ids"), nb::arg("all_buffer_ptrs"))
+            .def("sync", &Buffer::sync, nb::arg("device_ids"),
            nb::arg("all_gathered_handles"),
            nb::arg("root_unique_id_opt") = nb::none(),
            nb::arg("all_gathered_rdma_handles") = nb::none())
@@ -1877,12 +1906,15 @@ NB_MODULE(ep, m) {
               EventHandle ev = nb::cast<EventHandle>(previous_event);
               prev = ev;
             }
-            return self.intranode_prepare(
-                num_tokens_per_rank_ptr, is_token_in_rank_ptr,
-                num_tokens_per_expert_ptr, num_tokens, num_experts,
-                rank_prefix_matrix_ptr, channel_prefix_matrix_ptr,
-                expert_alignment, num_worst_tokens, config, prev, async,
-                allocate_on_comm_stream, compute_stream_ptr);
+            {
+              nb::gil_scoped_release gil_release;
+              return self.intranode_prepare(
+                  num_tokens_per_rank_ptr, is_token_in_rank_ptr,
+                  num_tokens_per_expert_ptr, num_tokens, num_experts,
+                  rank_prefix_matrix_ptr, channel_prefix_matrix_ptr,
+                  expert_alignment, num_worst_tokens, config, prev, async,
+                  allocate_on_comm_stream, compute_stream_ptr);
+            }
           },
           nb::arg("num_tokens_per_rank_ptr"), nb::arg("is_token_in_rank_ptr"),
           nb::arg("num_tokens_per_expert_ptr"), nb::arg("num_tokens"),
@@ -1915,16 +1947,19 @@ NB_MODULE(ep, m) {
               EventHandle ev = nb::cast<EventHandle>(previous_event);
               prev = ev;
             }
-            return self.intranode_dispatch(
-                x_ptr, num_tokens, hidden, x_element_size, x_scales_ptr,
-                num_scales, scale_token_stride, scale_hidden_stride,
-                topk_idx_ptr, num_topk, topk_weights_ptr, is_token_in_rank_ptr,
-                rank_prefix_matrix_ptr, channel_prefix_matrix_ptr, num_experts,
-                num_worst_tokens, cached_mode, config, num_recv_tokens,
-                recv_x_ptr, recv_x_scales_ptr, recv_topk_idx_ptr,
-                recv_topk_weights_ptr, recv_channel_prefix_matrix_ptr,
-                recv_src_idx_ptr, send_head_ptr, prev, async,
-                allocate_on_comm_stream, compute_stream_ptr);
+            {
+              nb::gil_scoped_release gil_release;
+              return self.intranode_dispatch(
+                  x_ptr, num_tokens, hidden, x_element_size, x_scales_ptr,
+                  num_scales, scale_token_stride, scale_hidden_stride,
+                  topk_idx_ptr, num_topk, topk_weights_ptr, is_token_in_rank_ptr,
+                  rank_prefix_matrix_ptr, channel_prefix_matrix_ptr, num_experts,
+                  num_worst_tokens, cached_mode, config, num_recv_tokens,
+                  recv_x_ptr, recv_x_scales_ptr, recv_topk_idx_ptr,
+                  recv_topk_weights_ptr, recv_channel_prefix_matrix_ptr,
+                  recv_src_idx_ptr, send_head_ptr, prev, async,
+                  allocate_on_comm_stream, compute_stream_ptr);
+            }
           },
           nb::arg("x_ptr"), nb::arg("num_tokens"), nb::arg("hidden"),
           nb::arg("x_element_size"), nb::arg("x_scales_ptr"),
@@ -1960,13 +1995,16 @@ NB_MODULE(ep, m) {
               EventHandle ev = nb::cast<EventHandle>(previous_event);
               prev = ev;
             }
-            return self.intranode_combine(
-                x_ptr, num_tokens, hidden, x_dtype_code, x_element_size,
-                topk_weights_ptr, num_topk, bias_0_ptr, bias_1_ptr, src_idx_ptr,
-                num_recv_tokens, rank_prefix_matrix_ptr,
-                channel_prefix_matrix_ptr, send_head_ptr, config, recv_x_ptr,
-                recv_topk_weights_ptr, prev, async, allocate_on_comm_stream,
-                compute_stream_ptr);
+            {
+              nb::gil_scoped_release gil_release;
+              return self.intranode_combine(
+                  x_ptr, num_tokens, hidden, x_dtype_code, x_element_size,
+                  topk_weights_ptr, num_topk, bias_0_ptr, bias_1_ptr, src_idx_ptr,
+                  num_recv_tokens, rank_prefix_matrix_ptr,
+                  channel_prefix_matrix_ptr, send_head_ptr, config, recv_x_ptr,
+                  recv_topk_weights_ptr, prev, async, allocate_on_comm_stream,
+                  compute_stream_ptr);
+            }
           },
           nb::arg("x_ptr"), nb::arg("num_tokens"), nb::arg("hidden"),
           nb::arg("x_dtype_code"), nb::arg("x_element_size"),

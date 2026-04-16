@@ -1,0 +1,70 @@
+# Makefile.rocm_jax - Build UCCL-EP for ROCm without PyTorch dependencies
+
+ROCM_PATH ?= /opt/rocm
+HIPCC := $(ROCM_PATH)/bin/hipcc
+
+PYTHON ?= python3
+NB_DIR := $(shell $(PYTHON) -c "import nanobind as _nb, os; print(os.path.dirname(_nb.__file__))")
+NB_INCLUDES := -I$(NB_DIR)/include -I$(NB_DIR)/ext/robin_map/include \
+               -I$(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_path(\"include\"))")
+PY_STABLE_ABI_OK := $(shell $(PYTHON) -c "import sys; print(1 if sys.version_info >= (3, 12) else 0)")
+ifeq ($(PY_STABLE_ABI_OK),1)
+NB_ABI_FLAGS := -DPy_LIMITED_API=0x030C0000 -DNB_STABLE_ABI=1
+EXT_SUFFIX := .abi3.so
+else
+NB_ABI_FLAGS :=
+EXT_SUFFIX := $(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_config_var(\"EXT_SUFFIX\"))")
+endif
+NB_SRC_DIR := $(NB_DIR)/src
+NB_SRCS := nb_internals.cpp nb_func.cpp nb_type.cpp nb_enum.cpp \
+           nb_ndarray.cpp nb_static_property.cpp common.cpp error.cpp \
+           trampoline.cpp implicit.cpp
+NB_OBJECTS := $(addprefix build/nb_,$(NB_SRCS:.cpp=.o))
+
+COMMON_DEFS := -D__HIP_PLATFORM_AMD__ -D_GLIBCXX_USE_CXX11_ABI=1
+INCLUDES := -Iinclude/cuda_compat -Iinclude -I$(ROCM_PATH)/include -I/usr/include -I../include
+CXXFLAGS := -O3 -std=c++17 -Wall -pthread -fPIC -fvisibility=hidden -Wno-interference-size -Wno-unused-function $(COMMON_DEFS)
+HIPCC_COMMON := $(CXXFLAGS) -include include/cuda_compat/cuda_runtime.h -Wno-deprecated-declarations
+
+# For libraries that need libibverbs etc.
+LDFLAGS := -lpthread -libverbs -lnl-3 -lnl-route-3 -lnuma -L$(ROCM_PATH)/lib -lamdhip64
+
+SRC_CPP := src/proxy.cpp src/rdma.cpp src/common.cpp src/uccl_proxy.cpp src/uccl_bench.cpp src/fifo.cpp
+SRC_CU := src/bench_kernel.cu src/internode_ll.cu src/internode.cu src/layout.cu src/intranode.cu src/ep_runtime.cu
+SRC_BIND := src/uccl_ep.cc
+
+OBJ_CPP := $(addprefix build/,$(notdir $(SRC_CPP:.cpp=.o)))
+OBJ_CU := $(addprefix build/,$(notdir $(SRC_CU:.cu=.o)))
+OBJ_BIND := build/uccl_ep.o
+EP_EXT := ep$(EXT_SUFFIX)
+
+.PHONY: all clean
+
+all: build $(EP_EXT)
+
+build:
+	mkdir -p build
+
+build/%.o: src/%.cpp | build
+	$(HIPCC) $(HIPCC_COMMON) $(NB_ABI_FLAGS) $(INCLUDES) $(NB_INCLUDES) -MMD -MP -c $< -o $@
+
+build/%.o: src/%.cu | build
+	$(HIPCC) $(HIPCC_COMMON) $(INCLUDES) -MMD -MP -c $< -o $@
+
+build/uccl_ep.o: src/uccl_ep.cc | build
+	$(HIPCC) $(HIPCC_COMMON) $(NB_ABI_FLAGS) $(INCLUDES) $(NB_INCLUDES) -MMD -MP -c $< -o $@
+
+build/nb_%.o: $(NB_SRC_DIR)/%.cpp | build
+	g++ -O3 -std=c++17 -fPIC -fvisibility=hidden $(NB_ABI_FLAGS) $(NB_INCLUDES) -c $< -o $@
+
+$(EP_EXT): $(OBJ_CPP) $(OBJ_CU) $(OBJ_BIND) $(NB_OBJECTS)
+	$(HIPCC) $(CXXFLAGS) -shared -fPIC \
+	    $(INCLUDES) $(NB_INCLUDES) $^ \
+	    -L$(ROCM_PATH)/lib -Wl,-rpath,$(ROCM_PATH)/lib \
+	    -lamdhip64 $(LDFLAGS) -o $@
+
+clean:
+	rm -rf build $(EP_EXT)
+
+DEPS := $(OBJ_CPP:.o=.d) $(OBJ_CU:.o=.d) $(OBJ_BIND:.o=.d)
+-include $(DEPS)
