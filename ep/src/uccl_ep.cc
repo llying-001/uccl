@@ -91,10 +91,8 @@ static cudaDataType_t cuda_dtype_from_code(int dtype) {
       return CUDA_R_64F;
     case kBool:
       return CUDA_R_8I;
-#if !defined(__HIP_PLATFORM_AMD__) && !defined(__HIPCC__)
     case kFloat8E4M3:
       return CUDA_R_8F_E4M3;
-#endif
     default:
       throw std::invalid_argument("Unsupported dtype code for CUDA kernel");
   }
@@ -572,26 +570,33 @@ class Buffer {
   void destroy() {
     EP_HOST_ASSERT(not destroyed);
 
-    // Synchronize
+    CUDA_CHECK(cudaSetDevice(device_index));
     CUDA_CHECK(cudaDeviceSynchronize());
 
     if (num_nvl_bytes > 0) {
-      // Barrier
-      intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks,
-                         comm_stream);
-      CUDA_CHECK(cudaDeviceSynchronize());
+      if (same_process_mode) {
+        // In same-process mode, peer buffer_ptrs are direct pointers owned by
+        // other Buffer instances — do NOT call cudaIpcCloseMemHandle on them.
+        // Skip the GPU barrier too: it requires all ranks to participate
+        // concurrently, which is impossible when buffers are destroyed
+        // sequentially from a single thread. The caller is responsible for
+        // ensuring all GPU work is complete before calling destroy.
+      } else {
+        intranode::barrier(barrier_signal_ptrs_gpu, nvl_rank, num_nvl_ranks,
+                           comm_stream);
+        CUDA_CHECK(cudaDeviceSynchronize());
 
-      // Close remote IPC
-      if (is_available()) {
-        for (int i = 0; i < num_nvl_ranks; ++i)
-          if (i != nvl_rank) CUDA_CHECK(cudaIpcCloseMemHandle(buffer_ptrs[i]));
+        if (is_available()) {
+          for (int i = 0; i < num_nvl_ranks; ++i)
+            if (i != nvl_rank)
+              CUDA_CHECK(cudaIpcCloseMemHandle(buffer_ptrs[i]));
+        }
       }
 
-      // Free local buffer and error flag
       CUDA_CHECK(cudaFree(buffer_ptrs[nvl_rank]));
     }
 
-    if (num_rdma_bytes > 0) {
+    if (num_rdma_bytes > 0 && !same_process_mode) {
       for (int i = 0; i < num_nvl_ranks; ++i) {
         if (i != nvl_rank && ipc_rdma_base_ptrs[i] != nullptr) {
           CUDA_CHECK(cudaIpcCloseMemHandle(ipc_rdma_base_ptrs[i]));
@@ -599,16 +604,13 @@ class Buffer {
       }
     }
 
-    // Free workspace and MoE counter
     CUDA_CHECK(cudaFree(workspace));
     if (d_ipc_rdma_base_ptrs != nullptr) {
       CUDA_CHECK(cudaFree(d_ipc_rdma_base_ptrs));
     }
     CUDA_CHECK(cudaFreeHost(const_cast<int*>(moe_recv_counter)));
 
-    // Free chunked mode staffs
     CUDA_CHECK(cudaFreeHost(const_cast<int*>(moe_recv_expert_counter)));
-    // Free D2HHandle device-side arrays if allocated
     if (d_handle_objs) {
       CUDA_CHECK(cudaFree(d_handle_objs));
       d_handle_objs = nullptr;
@@ -1435,11 +1437,14 @@ class Buffer {
 
 
   void sync_same_process(std::vector<int> const& device_ids,
-                         std::vector<std::uintptr_t> const& all_buffer_ptrs) {
+                         std::vector<std::uintptr_t> const& all_buffer_ptrs,
+                         std::vector<std::uintptr_t> const& all_rdma_buffer_ptrs = {}) {
     EP_HOST_ASSERT(not is_available());
     EP_HOST_ASSERT(num_nvl_bytes > 0);
     EP_HOST_ASSERT(static_cast<std::size_t>(num_ranks) == device_ids.size());
     EP_HOST_ASSERT(static_cast<std::size_t>(num_ranks) == all_buffer_ptrs.size());
+
+    CUDA_CHECK(cudaSetDevice(device_index));
 
     for (int i = 0, offset = rdma_rank * num_nvl_ranks; i < num_nvl_ranks; ++i) {
       int global_rank = offset + i;
@@ -1451,12 +1456,31 @@ class Buffer {
       }
     }
 
-    CUDA_CHECK(cudaSetDevice(device_index));
     CUDA_CHECK(cudaMemcpy(buffer_ptrs_gpu, buffer_ptrs,
                           sizeof(void*) * max_nvl_peers, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(barrier_signal_ptrs_gpu, barrier_signal_ptrs,
                           sizeof(int*) * max_nvl_peers, cudaMemcpyHostToDevice));
+
+    if (num_rdma_bytes > 0 && !all_rdma_buffer_ptrs.empty()) {
+      EP_HOST_ASSERT(static_cast<std::size_t>(num_ranks) == all_rdma_buffer_ptrs.size());
+      if (rdma_buffer_ptr) {
+        reset_rdma_buffer();
+      }
+      for (int i = 0, offset = rdma_rank * num_nvl_ranks; i < num_nvl_ranks; ++i) {
+        int global_rank = offset + i;
+        int local_rank_idx = global_rank % max_nvl_peers;
+        ipc_rdma_base_ptrs[local_rank_idx] =
+            reinterpret_cast<void*>(all_rdma_buffer_ptrs[global_rank]);
+      }
+      if (d_ipc_rdma_base_ptrs != nullptr) {
+        CUDA_CHECK(cudaMemcpy(d_ipc_rdma_base_ptrs, ipc_rdma_base_ptrs,
+                              sizeof(void*) * max_nvl_peers,
+                              cudaMemcpyHostToDevice));
+      }
+    }
+
     CUDA_CHECK(cudaDeviceSynchronize());
+    same_process_mode = true;
     available = true;
   }
 
@@ -1656,6 +1680,7 @@ class Buffer {
   // clang-format on
 
   bool destroyed = false;
+  bool same_process_mode = false;
 
   // Ring buffers
   int num_d2h_channel_addrs{0};
@@ -1857,7 +1882,8 @@ NB_MODULE(ep, m) {
       .def("get_local_uccl_shmem_unique_id",
            &Buffer::get_local_uccl_shmem_unique_id)
       .def("sync_same_process", &Buffer::sync_same_process,
-           nb::arg("device_ids"), nb::arg("all_buffer_ptrs"))
+           nb::arg("device_ids"), nb::arg("all_buffer_ptrs"),
+           nb::arg("all_rdma_buffer_ptrs") = std::vector<std::uintptr_t>{})
             .def("sync", &Buffer::sync, nb::arg("device_ids"),
            nb::arg("all_gathered_handles"),
            nb::arg("root_unique_id_opt") = nb::none(),

@@ -61,9 +61,23 @@ UcclProxy::UcclProxy(int thread_idx, uintptr_t gpu_buffer_addr,
     cudaMallocManaged(&atomic_buffer_ptr_, kAtomicBufferSize);
     atomic_buffer_is_host_allocated_ = false;
 #elif defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-    hipExtMallocWithFlags(&atomic_buffer_ptr_, kAtomicBufferSize,
-                          hipDeviceMallocUncached);
-    atomic_buffer_is_host_allocated_ = false;
+    if (!is_intranode && can_register_gpu_memory_for_atomics(local_rank)) {
+      hipExtMallocWithFlags(&atomic_buffer_ptr_, kAtomicBufferSize,
+                            hipDeviceMallocUncached);
+      atomic_buffer_is_host_allocated_ = false;
+    } else if (!is_intranode) {
+      fprintf(stderr,
+              "[UcclProxy] GPU %d: ibv_reg_mr probe failed for atomic buffer, "
+              "falling back to host memory\n",
+              local_rank);
+      hipHostMalloc(&atomic_buffer_ptr_, kAtomicBufferSize,
+                    hipHostMallocMapped);
+      atomic_buffer_is_host_allocated_ = true;
+    } else {
+      hipExtMallocWithFlags(&atomic_buffer_ptr_, kAtomicBufferSize,
+                            hipDeviceMallocUncached);
+      atomic_buffer_is_host_allocated_ = false;
+    }
 #elif defined(EFA)
     // EFA: atomic buffer is always pinned host memory (cudaHostAlloc).
     cudaHostAlloc(&atomic_buffer_ptr_, kAtomicBufferSize,
@@ -97,7 +111,10 @@ UcclProxy::~UcclProxy() {
 #if defined(USE_GRACE_HOPPER)
     cudaFree(atomic_buffer_ptr_);
 #elif defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-    hipFree(atomic_buffer_ptr_);
+    if (atomic_buffer_is_host_allocated_)
+      hipHostFree(atomic_buffer_ptr_);
+    else
+      hipFree(atomic_buffer_ptr_);
 #else
     if (atomic_buffer_is_host_allocated_)
       cudaFreeHost(atomic_buffer_ptr_);

@@ -21,7 +21,7 @@ NB_SRCS := nb_internals.cpp nb_func.cpp nb_type.cpp nb_enum.cpp \
            trampoline.cpp implicit.cpp
 NB_OBJECTS := $(addprefix build/nb_,$(NB_SRCS:.cpp=.o))
 
-COMMON_DEFS := -D__HIP_PLATFORM_AMD__ -D_GLIBCXX_USE_CXX11_ABI=1
+COMMON_DEFS := -D__HIP_PLATFORM_AMD__ -D_GLIBCXX_USE_CXX11_ABI=1 -DDISABLE_SM90_FEATURES
 INCLUDES := -Iinclude/cuda_compat -Iinclude -I$(ROCM_PATH)/include -I/usr/include -I../include
 CXXFLAGS := -O3 -std=c++17 -Wall -pthread -fPIC -fvisibility=hidden -Wno-interference-size -Wno-unused-function $(COMMON_DEFS)
 HIPCC_COMMON := $(CXXFLAGS) -include include/cuda_compat/cuda_runtime.h -Wno-deprecated-declarations

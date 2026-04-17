@@ -391,11 +391,18 @@ def test_single_process_multi_gpu():
 
     # ── Cleanup ──
     print("[PoC] Cleaning up...")
-    for buf in buffers:
-        buf.destroy()
     for gpu_id in range(num_gpus):
+        hip_set_device(gpu_id)
+        ep.set_device(gpu_id)
+        buffers[gpu_id].destroy()
+
+    for gpu_id in range(num_gpus):
+        hip_set_device(gpu_id)
         for proxy in all_proxies[gpu_id]:
-            proxy.stop()
+            try:
+                proxy.stop()
+            except RuntimeError:
+                pass
         ep.unregister_proxy(gpu_id)
         d = per_gpu[gpu_id]
         for key in ['topk_idx', 'ntpr', 'ntpe', 'itir', 'x', 'rpm', 'cpm',
@@ -403,11 +410,14 @@ def test_single_process_multi_gpu():
             if key in d and d[key]:
                 try:
                     hip_free(d[key])
-                except:
+                except Exception:
                     pass
         hip_stream_destroy(d['stream'])
     for ptr in scratch_ptrs:
-        hip_free(ptr)
+        try:
+            hip_free(ptr)
+        except Exception:
+            pass
     cleanup_shm()
 
     print("\n" + "=" * 60)

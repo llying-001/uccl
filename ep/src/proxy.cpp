@@ -78,8 +78,7 @@ void unmap_local_barrier_shm(std::string const& name, LocalBarrier* lb,
 }
 #endif
 
-Proxy::Proxy(Config const& cfg) : cfg_(cfg) {
-  // Initialize state tracking for each ring buffer
+Proxy::Proxy(Config const& cfg) : cfg_(cfg), atomic_buffer_ptr_(nullptr) {
   listen_port_ = uccl::create_listen_socket(&listen_fd_);
 #ifndef USE_MSCCLPP_FIFO_BACKEND
   ring_tails_.resize(cfg_.d2h_queues.size(), 0);
@@ -192,15 +191,18 @@ void Proxy::init_common() {
         );
 
     if (!ctx_.atomic_buffer_mr) {
-      perror("Failed to register atomic_buffer_ptr MR");
-      std::abort();
+      fprintf(stderr,
+              "[Proxy] WARNING: ibv_reg_mr failed for atomic_buffer_ptr on "
+              "rank %d thread %d (errno=%d: %s). "
+              "Internode atomics may not work.\n",
+              cfg_.rank, cfg_.thread_idx, errno, strerror(errno));
+    } else {
+      fprintf(stderr,
+              "[Proxy] Registered atomic_buffer_ptr MR: addr=0x%llx, len=%zu, "
+              "rkey=0x%x\n",
+              (unsigned long long)ctx_.atomic_buffer_mr->addr,
+              (size_t)ctx_.atomic_buffer_mr->length, ctx_.atomic_buffer_mr->rkey);
     }
-
-    fprintf(stderr,
-            "[Proxy] Registered atomic_buffer_ptr MR: addr=0x%llx, len=%zu, "
-            "rkey=0x%x\n",
-            (unsigned long long)ctx_.atomic_buffer_mr->addr,
-            (size_t)ctx_.atomic_buffer_mr->length, ctx_.atomic_buffer_mr->rkey);
   }
 
   if (ctxs_for_all_ranks_.empty()) {
